@@ -1,0 +1,197 @@
+---
+title: "Hemp Downy Mildew Oospore Analysis"
+author: "T. Q. Herrmann th589@cornell.edu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(dunn.test)
+library(readxl)
+```
+
+```{r}
+df <- read_xlsx("Oospore_data.xlsx", na = "NA")
+```
+
+# 1. Morphology --\> size
+
+## 1.1 Mean
+```{r}
+morph <- df %>% filter(assay == "morphology")
+
+#Overall mean
+morph %>%
+  summarize(mean_diam = mean(mean_diam_um, na.rm = TRUE),
+            sd_diam = sd(mean_diam_um, na.rm = TRUE))
+```
+
+**Mean Diam:** 38.46 Standard dev diam: 7.62
+
+```{r}
+#Per isolate
+morph %>%
+  group_by(isolate) %>%
+  summarize(mean_diam = mean(mean_diam_um, na.rm = TRUE),
+            sd_diam = sd(mean_diam_um, na.rm = TRUE),
+            n = n())
+```
+
+| Isolate | Mean diam | Sd diam |
+|---------|-----------|---------|
+| 21007   | 35.65     | 4.84    |
+| 22031   | 34.06     | 5.12    |
+| 25248   | 45.67     | 6.75    |
+
+## 1.2 Range
+```{r}
+morph %>%
+  summarize(min_diam = min(mean_diam_um, na.rm = TRUE),
+            max_diam = max(mean_diam_um, na.rm = TRUE))
+```
+Range: 25.446 um to 61.8545um
+
+```{r}
+morph %>%
+  group_by(isolate) %>%
+  summarize(min_diam = min(mean_diam_um, na.rm = TRUE),
+            max_diam = max(mean_diam_um, na.rm = TRUE))
+
+```
+ Isolate | min diam | max diam |
+|---------|-----------|---------|
+| 21007   | 25.46    | 52.51    |
+| 22031   | 25.45     | 49.00    |
+| 25248   | 28.50     | 61.86    |
+
+## 1.3 Are any isolates significantly differently sized than the others?
+
+```{r}
+# Check normality per isolate
+morph %>%
+  group_by(isolate) %>%
+  summarize(p_shapiro = shapiro.test(mean_diam_um)$p.value)
+
+# if p>0.05 for all isolates use ANOVA
+# if p<0.05 for any, use Kruskal-Wallis 
+```
+
+Two isolates (21007 and 22031) failed the normality test (p\<0.05) so we should use Kruskal-Wallis
+
+```{r}
+kruskal.test(mean_diam_um ~ factor(isolate), data = morph)
+```
+
+Note:
+
+- ANOVA assumes your data is normally distributed.
+
+- Kruskal-Wallils is the non parametric equivalent, so it doesn't assume normality. Instead of comparing means, it ranks all the values and compares those ranks across groups.
+
+```{r}
+# post hoc test 
+dunn.test(morph$mean_diam_um, morph$isolate, method = "bonferroni")
+```
+
+Note:
+
+- For ANOVA the post hoc test is Tukey HSD
+
+- For Kruskal its dunns test Both compare every possible pair of gropus to find which pairs are different
+
+| Comparison     | P value    | Take away                                   |
+|----------------|------------|---------------------------------------------|
+| 21007 vs 22031 | p = 0.1052 | not significantly different in oospore size |
+| 21007 vs 25248 | p \~ 0     | 25248 is sig larger then 21007              |
+| 22031 vs 25248 | p \~ 0     | 25248 is sig larger then 22031              |
+
+**Take away**: 21007 and 22031 produced similarly size oospores, and 25248 produces significantly larger oospores than the other two isolates
+
+## 1.2 Box plot
+
+```{r}
+# y position of significance letters
+letters_df <- data.frame(
+  isolate = factor(c("21007", "22031", "25248")),
+  label = c("a", "a", "b"),
+  y = c(56, 53, 65)  # adjust these values as needed
+)
+
+box <- ggplot(morph, aes(x = factor(isolate), y = mean_diam_um)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.3, size = 0.8) +
+  geom_text(data = letters_df, aes(x = isolate, y = y, label = label),
+            size = 4) +
+  labs(x = "Isolate", y = "Mean oospore diameter (µm)") +
+  theme_classic()
+
+print(box)
+ggsave("Plot_oospore.png", box, dpi = 600, width = 6.5, height = 4.5, units = "in")
+```
+
+```{r}
+# check outliers
+morph %>%
+  group_by(isolate) %>%
+  summarize(
+    Q1 = quantile(mean_diam_um, 0.25),
+    Q3 = quantile(mean_diam_um, 0.75),
+    IQR = IQR(mean_diam_um),
+    lower_fence = Q1 - 1.5 * IQR,
+    upper_fence = Q3 + 1.5 * IQR
+  )
+```
+
+```{r}
+# identify specific outliers
+morph %>%
+  group_by(isolate) %>%
+  filter(mean_diam_um > quantile(mean_diam_um, 0.75) + 1.5 * IQR(mean_diam_um) |
+         mean_diam_um < quantile(mean_diam_um, 0.25) - 1.5 * IQR(mean_diam_um)) %>%
+  select(isolate, oospore_num, mean_diam_um)
+```
+
+#2. Plasmolysis --\> viability
+
+```{r}
+plasm <- df %>% filter(assay == "plasmolysis")
+
+# Overall 
+plasm %>%
+  summarize(viable = sum(viable, na.rm = TRUE),
+            total = n(),
+            pct_viable = viable / total * 100)
+```
+
+```{r}
+# Per isolate
+plasm %>%
+  group_by(isolate) %>%
+  summarize(viable = sum(viable, na.rm = TRUE),
+            total = n(),
+            pct_viable = viable / total * 100)
+```
+
+## 2.1 Does viability differ across isolates?
+
+```{r}
+# Build contingency table
+plasm_table <- plasm %>%
+  group_by(isolate) %>%
+  summarize(viable = sum(viable),
+            not_viable = n() - sum(viable)) %>%
+  column_to_rownames("isolate") %>%
+  as.matrix()
+
+# Chi-square test
+chisq.test(plasm_table)
+```
+
+Note:
+
+- chi square test asks whether the distribution of counts across categories differs from what you would expect by chance.
+
+- Does viability depend on which isolate we're looking at
+
+**Takeaway**: - p=0.867 - viability is not sig. different across isolates. - All three isolates have statistically similar vaibility rates

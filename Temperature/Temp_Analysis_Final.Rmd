@@ -1,0 +1,853 @@
+---
+title: "Temp Analysis"
+author: "Taylere Herrmann - th589@cornell.edu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+# 1. Libraries
+```{r}
+library(multcomp) 
+library(readxl)
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(ggplot2)
+library(scales)
+library(glmmTMB)
+library(DHARMa)
+library(moments)
+```
+
+# 2. Load data
+```{r}
+df <- read_excel("Leaf_Disc_Temp_Master.xlsx")
+
+# Convert to tibble for easier viewing
+df <- as_tibble(df)
+
+# Create analysis dataset
+df_analysis <- df %>%
+  mutate(
+    isolate     = as.factor(isolate),
+    accession   = as.factor(accession),
+    temperature = set_temp_C,
+    replicate   = as.factor(replicate),
+    # raw integer count, summed over 3 hemacytometer loadings.
+    sporangia_count = total_sporangia_count_60uL,
+    sporulation_occurred = ifelse(sporangia_count > 0, 1, 0),
+    discs_sporulated = sporulation_incidence,   # 0-5
+    discs_total      = num_discs,               # 5
+    plate_id = interaction(isolate, accession, replicate, temperature, drop = TRUE)
+  ) %>%
+  mutate(accession = fct_recode(accession,
+                                "G 33312"     = "G33312",
+                                "'White CBG'" = "WhiteCBG"))
+```
+
+Conversion from hemacytometer count to sporangia per leaf disc.
+
+```{r}
+# Each 1 mm^2 hemacytometer square is 0.1 mm deep = 0.1 uL = 0.0001 mL.
+# One loading = 4 corner + 1 central square per side x 2 sides = 10 squares.
+# The count column is the sum of 3 loadings, so 30 squares were counted.
+squares_per_loading <- 10
+loadings_summed     <- 3
+vol_per_square      <- 0.0001   # mL
+vol_counted         <- squares_per_loading * loadings_summed * vol_per_square  # 0.003 mL
+
+suspension_vol      <- 5        # mL of water per plate
+discs_per_plate     <- 5
+
+# count / 0.003 mL  ->  sporangia per mL
+# x 5 mL / 5 discs  ->  sporangia per disc
+# (the x5 and /5 cancel: each disc accounts for exactly 1 mL of suspension,
+#  so sporangia per disc is numerically the same as sporangia per mL)
+disc_conversion <- (suspension_vol / vol_counted) / discs_per_plate   # = 333.33
+
+df_analysis <- df_analysis %>%
+  mutate(sporangia_per_disc = sporangia_count * disc_conversion)
+
+cat("Volume counted per plate:", vol_counted, "mL\n")
+cat("Conversion factor:", round(disc_conversion, 2), "\n")
+```
+
+Sanity check against the sporangia-per-mL column already in the spreadsheet.
+These two should be identical.
+
+```{r}
+  df_analysis %>%
+    mutate(computed = sporangia_count * disc_conversion) %>%
+    transmute(sporangia_count,
+              computed,
+              from_sheet = df$sporangia_concentration_mL,
+              difference = computed - df$sporangia_concentration_mL) %>%
+    head(10) %>%
+    print()
+
+```
+
+
+# 3. Explore raw data
+```{r}
+# Summary of data
+cat("  Total observations:", nrow(df_analysis), "\n")
+cat("  Observations WITH sporulation:", sum(df_analysis$sporulation_occurred), "\n")
+cat("  Observations with NO sporulation:", nrow(df_analysis) - sum(df_analysis$sporulation_occurred), "\n")
+cat("  Isolates tested:", n_distinct(df_analysis$isolate), "\n")
+cat("  Hemp accessions tested:", n_distinct(df_analysis$accession), "\n")
+cat("  Temperature treatments:", n_distinct(df_analysis$temperature), "\n\n")
+cat("Observations per isolate:\n")
+design_balance <- df_analysis %>%
+  group_by(isolate) %>%
+  summarise(
+    n_obs = n(),
+    n_replicates = n_distinct(replicate),
+    .groups = 'drop'
+  )
+print(as.data.frame(design_balance), row.names = FALSE)
+```
+
+
+```{r}
+cat("\nRaw hemacytometer counts (30 squares per plate):\n")
+cat("  Minimum count:", min(df_analysis$sporangia_count), "\n")
+cat("  Median count:", median(df_analysis$sporangia_count), "\n")
+cat("  Mean count:", round(mean(df_analysis$sporangia_count), 1), "\n")
+cat("  Maximum count:", max(df_analysis$sporangia_count), "\n")
+cat("  Std. Deviation:", round(sd(df_analysis$sporangia_count), 1), "\n")
+
+# Create bar plot of mean sporulation by temperature
+temp_hist_summary <- df_analysis %>%
+  group_by(temperature) %>%
+  summarise(
+    mean_per_disc = mean(sporangia_per_disc),
+    se_per_disc = sd(sporangia_per_disc) / sqrt(n()),
+    .groups = 'drop'
+  )
+
+p_temp_hist <- ggplot(temp_hist_summary, aes(x = factor(temperature), y = mean_per_disc, fill = factor(temperature))) +
+  geom_col(alpha = 0.85, color = "black", width = 0.7) +
+  geom_errorbar(aes(ymin = mean_per_disc - se_per_disc, ymax = mean_per_disc + se_per_disc),
+                width = 0.2, linewidth = 0.7) +
+  labs(title = "Mean Sporulation by Temperature",
+       x = "Temperature (°C)",
+       y = expression("Sporangia per leaf disc ("*10^3*")")) +
+  scale_y_continuous(labels = scales::label_number(scale = 1e-3)) +
+  scale_fill_brewer(palette = "OrRd") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = 'bold', hjust = 0.5),
+    axis.text = element_text(size = 11),
+    axis.title = element_text(size = 12),
+    legend.position = 'none'
+  )
+print(p_temp_hist)
+ggsave("Mean_sporulation_hist.png", p_temp_hist, dpi = 600, width = 6.5, height = 4.5, units = "in")
+```
+
+# 4. Incidence - sporulation
+## 4.1 Plate level sporulation (5dics per plate)
+Counts & Percentages
+```{r}
+# Sporulation by temperature
+temp_summary <- df_analysis %>%
+  group_by(temperature) %>%
+  summarise(
+    n = n(),
+    n_sporulated = sum(sporulation_occurred),
+    pct_sporulated = 100 * sum(sporulation_occurred) / n,
+    mean_per_disc = mean(sporangia_per_disc),
+    sd_per_disc = sd(sporangia_per_disc),
+    se_per_disc = sd_per_disc / sqrt(n),
+    min_per_disc = min(sporangia_per_disc),
+    max_per_disc = max(sporangia_per_disc),
+    .groups = 'drop'
+  ) %>%
+  arrange(temperature)
+print(as.data.frame(temp_summary), row.names = FALSE, digits = 5)
+```
+Across all isolates and accessions, temperatures 18, 20, and 25 all exhibited 100% sporulation incidence on the plate level
+
+## 4.2 Disc level incidence
+Counts & Percentages
+```{r}
+# Disc-level incidence summary (from visual scores, not pooled counts)
+inc_summary <- df_analysis %>%
+  group_by(temperature) %>%
+  summarise(
+    n_plates = n(),
+    discs_total = sum(discs_total),
+    discs_spor = sum(discs_sporulated),
+    pct_discs = 100 * discs_spor / discs_total,
+    .groups = "drop"
+  ) %>%
+  arrange(temperature)
+print(as.data.frame(inc_summary))
+```
+
+## 4.3 Model
+Significance testing
+```{r}
+df_inc <- df_analysis %>% filter(!temperature %in% c(10, 20, 30))
+
+inc_mod <- glmmTMB(
+  cbind(discs_sporulated, discs_total - discs_sporulated) ~
+    factor(temperature) + isolate + accession + (1 | plate_id),
+  family = binomial,
+  data = df_inc
+)
+
+# Check overdispersion — if present, switch family to betabinomial
+sim_inc <- simulateResiduals(inc_mod, n = 1000)
+testDispersion(sim_inc)
+
+car::Anova(inc_mod, type = "III")
+emmeans(inc_mod, ~ factor(temperature), type = "response")
+```
+Note: dispersion test is clean: p = 0.52, dispersion 1.09, so stay with binomial model.
+
+Temperature p=0.001
+Isolate p=0.0039
+Accession p =0.0025
+
+Temperature, isolate, and accession effect incidence, independent of severity.
+
+Since 30C has no sporualtion (0), 10C has 1/165 and 20 has 100% sporulation, it causes complete seperation in the model, causing the model to fail for those temperature points. These get reported as raw numbers, and signficance testing is appliciable where the outcome is actually varaible.
+
+So, we have boundary temperatures (raw counts only, no test possible)
+10C: 1/165
+20C: 165/165
+30C: 0/165
+
+Interior temperature s(model tested, pairwise contrasts are valid)
+15C:142/165
+18C:161/165
+25C:126/165
+
+```{r}
+# plate_id has one observation per level, so it acts as an observation-level
+# random effect. It absorbs overdispersion, which is why testDispersion looks
+# clean. Robustness check: refit as betabinomial with no OLRE and confirm the
+# same conclusions.
+inc_mod_bb <- glmmTMB(
+  cbind(discs_sporulated, discs_total - discs_sporulated) ~
+    factor(temperature) + isolate + accession,
+  family = betabinomial,
+  data = df_inc
+)
+car::Anova(inc_mod_bb, type = "III")
+
+# Likelihood ratio tests are more reliable than Wald tests when an odds ratio
+# is large and imprecise (the isolate contrast here).
+drop1(inc_mod, test = "Chisq")
+```
+
+```{r}
+inc_emm <- emmeans(inc_mod, ~ factor(temperature))
+pairs(inc_emm, adjust = "tukey", type = "response")
+```
+Pairwise results:
+18C vs 25C: p = 0.001 18C has sig more incidence than 25
+15 vs 18C: p = 0.038, sig different
+15 vs 25: p=0.2089, not sig different
+
+```{r}
+isolate_inc_emm <- emmeans(inc_mod, ~ isolate, type = "response")
+pairs(isolate_inc_emm, adjust = "tukey")
+
+print(isolate_inc_emm)
+```
+Isolate:
+21007 vs 22031: not significant (p=0.108)
+21007 vs 25248: not sig. (p=0.167)
+22031 vs 25248: p=0.0032, odds ratio of 39.4. 25248 has a higher odds of a disc sprulating than 22031
+
+So, 22031 has sig. lower incidence than 25248 and 21007 sits in between and isnt distinguisable from either.
+
+```{r}
+accession_inc_emm <- emmeans(inc_mod, ~ accession, type = "response")
+pairs(accession_inc_emm, adjust = "tukey")
+
+print(accession_inc_emm)
+```
+
+
+Accession:
+G3312 vs GVA: p=0.0086. G33312 is significantly lower incidence (OR0.70)
+G33312 vs WCBG: p = 0.0095) G33312 sig lower incidence (OR = 0.065)
+GVA vs WCBG: not sig (p = 0.997)
+
+So, G33312 has sig. lower incidenc than both other accessions, which dont differ from eachtoerh.
+
+# 5. Severity:
+
+## 5.1 Plot - Severity by isolate
+Sporulation reponse for each isolate across all temperatures (Accessions combined to get overall mean)
+
+```{r}
+p1 <- df_analysis %>%
+  group_by(temperature, isolate) %>%
+  summarise(
+    mean_per_disc = mean(sporangia_per_disc),
+    se_per_disc = sd(sporangia_per_disc) / sqrt(n()),
+    n = n(),
+    .groups = 'drop'
+  ) %>%
+  ggplot(aes(x = temperature, y = mean_per_disc, color = isolate, shape = isolate)) +
+  geom_point(size = 4, alpha = 0.8) +
+  geom_line(linetype = 'dashed', alpha = 0.6, linewidth = 0.8) +
+  geom_errorbar(aes(ymin = mean_per_disc - se_per_disc, ymax = mean_per_disc + se_per_disc),
+                width = 1.5, alpha = 0.6, linewidth = 0.7) +
+  scale_color_manual(values = c("21007" = "#7C6BAF", #4A7C7C,
+                                "22031" = "#3AAFB9", #A0522D,
+                                "25248" = "#D8817A" #6B7A3A
+                                )) +
+  labs(title = "Sporulation Response by Isolate",
+       x = "Temperature (°C)",
+       y = expression("Sporangia per leaf disc ("*10^3*")"),
+       color = "Isolate",
+       shape = "Isolate") +
+  scale_y_continuous(labels = scales::label_number(scale = 1e-3)) +
+  scale_x_continuous(breaks = seq(10, 30, by = 5)) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = 'bold', hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, color = "gray40"),
+    axis.text = element_text(size = 11),
+    axis.title = element_text(size = 12),
+    legend.position = 'right'
+  )
+print(p1)
+ggsave("Sporulation_by_isolate.png", p1, dpi = 600, width = 6.5, height = 4.5, units = "in")
+```
+For each isolate, 20C was the temperature in which the most sporulation occured.
+Isolate 21007 sporulated the most, followed by 25248, and 22031 with the least sporulation.
+(Descriptive only - the model found no significant isolate effect on severity.)
+
+## 5.2 Plot - Severity by isolate & hemp accession
+Which hemp accession is the most susceptible among those tested.
+```{r}
+p2 <- df_analysis %>%
+  group_by(temperature, isolate, accession) %>%
+  summarise(
+    mean_per_disc = mean(sporangia_per_disc),
+    se_per_disc = sd(sporangia_per_disc) / sqrt(n()),
+    n = n(),
+    .groups = 'drop'
+  ) %>%
+  ggplot(aes(x = temperature, y = mean_per_disc, color = isolate, shape = isolate)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_line(linetype = 'dashed', alpha = 0.6, linewidth = 0.7) +
+  geom_errorbar(aes(ymin = mean_per_disc - se_per_disc, ymax = mean_per_disc + se_per_disc),
+                width = 1, alpha = 0.5, linewidth = 0.6) +
+   scale_color_manual(values = c("21007" = "#7C6BAF", #4A7C7C,
+                                "22031" = "#3AAFB9", #A0522D,
+                                "25248" = "#D8817A" #6B7A3A
+                                )) +
+  facet_wrap(~ accession, nrow = 1) +
+  # NOTE: the old scale_y_continuous(limits = c(0, 450)) was removed.
+  # `limits` DROPS data outside the range rather than zooming, so on the
+  # per-disc scale it would have deleted every point. Use coord_cartesian()
+  # if you ever want to zoom without losing data.
+  scale_y_continuous(labels = scales::label_number(scale = 1e-3)) +
+  scale_x_continuous(breaks = seq(10, 30, by = 5)) +
+  labs(
+       x = "Temperature (°C)",
+       y = expression("Sporangia per leaf disc ("*10^3*")"),
+       color = "Isolate",
+       shape = "Isolate") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = 'bold', hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, color = "gray40"),
+    axis.text = element_text(size = 10),
+    strip.text = element_text(size = 11, face = 'bold'),
+    legend.position = 'bottom'
+  )
+
+print(p2)
+ggsave("Sporulation_by_accession.png", p2, dpi = 600, width = 6.5, height = 4.5, units = "in")
+```
+White CBG was the most susceptible with the most sporulation, followed by GVA-H-25-1010_019, and G 33312 with the least sporulation.
+
+## 5.3 Counts
+```{r}
+# For all data combined
+max_overall <- df_analysis %>%
+  group_by(temperature) %>%
+  summarise(mean_per_disc = mean(sporangia_per_disc), .groups = 'drop') %>%
+  slice_max(mean_per_disc, n = 1)
+cat("  Temperature:", max_overall$temperature, "°C\n")
+cat("  Mean:", round(max_overall$mean_per_disc, 0), "sporangia per leaf disc\n\n")
+```
+Temp that produced the most spoulatoin for all isolates & accesions combined --> 20C
+
+```{r}
+# By isolate
+max_by_isolate <- df_analysis %>%
+  group_by(isolate, temperature) %>%
+  summarise(mean_per_disc = mean(sporangia_per_disc), .groups = 'drop') %>%
+  group_by(isolate) %>%
+  slice_max(mean_per_disc, n = 1) %>%
+  ungroup()
+
+for (i in 1:nrow(max_by_isolate)) {
+  row <- max_by_isolate[i, ]
+  cat("  Isolate", as.character(row$isolate), ":", row$temperature, "°C (",
+      round(row$mean_per_disc, 0), "sporangia per leaf disc)\n")
+}
+```
+Temperature in which each downy isolate sporulated the most:
+- 21007: 20C
+- 22031: 20C
+- 25248: 20C
+
+```{r}
+# By isolate and accession
+max_by_all <- df_analysis %>%
+  group_by(isolate, accession, temperature) %>%
+  summarise(mean_per_disc = mean(sporangia_per_disc), .groups = 'drop') %>%
+  group_by(isolate, accession) %>%
+  slice_max(mean_per_disc, n = 1) %>%
+  ungroup() %>%
+  arrange(isolate, accession)
+
+print(max_by_all)
+```
+Temperature in which each isolate/hemp accession combination produced the most sporangia was 20C except for the following two combinations:
+- 22031 on G33312 (18)
+- 25248 on G33312 (18)
+
+
+```{r}
+# Mean sporangia per leaf disc by temperature (observed, pooled across isolates/accessions).
+# This feeds both Table 1 and the Fig. 1B points.
+per_disc_summary <- df_analysis %>%
+  group_by(temperature) %>%
+  summarise(
+    n_plates      = n(),
+    mean_per_disc = mean(sporangia_per_disc),
+    sd_per_disc   = sd(sporangia_per_disc),
+    se_per_disc   = sd_per_disc / sqrt(n_plates),
+    min_per_disc  = min(sporangia_per_disc),
+    max_per_disc  = max(sporangia_per_disc),
+    .groups = "drop"
+  )
+print(as.data.frame(per_disc_summary), digits = 5)
+```
+
+## 5.4. Model diagnostics & selection
+```{r}
+# Shapiro-Wilk on the raw response. Note this tests the MARGINAL distribution,
+# not model residuals, so treat it as exploratory. The variance/mean ratio and
+# the DHARMa checks below are the stronger evidence for the Methods section.
+shapiro_test <- shapiro.test(df_analysis$sporangia_count)
+cat("  Test statistic W:", round(shapiro_test$statistic, 4), "\n")
+cat("  P-value:", format(shapiro_test$p.value, scientific = TRUE), "\n\n")
+## null hypothesis = data normally distributed
+```
+P < 0.05 = data is NOT normally distributed
+
+```{r}
+# Q-Q plot (normal probability plot)
+qqnorm(df_analysis$sporangia_count, main = "Q-Q Plot: Raw Data")
+qqline(df_analysis$sporangia_count)
+## if points follow line = normal, if curved not normal
+```
+Data is not normal
+
+```{r}
+# Is data skewed?
+# Calculate skewness
+skewness_value <- skewness(df_analysis$sporangia_count)
+cat("Skewness Coefficient:", round(skewness_value, 3), "\n\n")
+## Skewness = 0 --> symmetric
+## Skewness > 0 --> right skewed (tail on right)
+## Skewness > 2 --> highly skewed
+```
+Skewness = 2.29 == data is highly right skewed
+
+```{r}
+# Over dispersion - is variance larger than mean
+mean_spor <- mean(df_analysis$sporangia_count)
+var_spor <- var(df_analysis$sporangia_count)
+ratio <- var_spor / mean_spor
+
+cat("Mean:", round(mean_spor, 2), "\n")
+cat("Variance:", round(var_spor, 2), "\n")
+cat("Variance/Mean Ratio:", round(ratio, 2), "\n\n")
+
+## Poisson model assumes that Variance = mean (so the ratio is 1)
+### ratio < 1.5 = data is poisson like and linear or poisson model might work
+### ratio 1.5-5 = moderate over dispersion, negative binomial model is recommended
+### ratio > 5 = sever over dispersion, use negative binomial model
+```
+Data has severe over dispersion, should use negative binomial model
+
+```{r}
+# Model comparison: linear vs poisson vs negative binomial
+
+# Linear mixed model.
+# REML = FALSE is required here: a REML-based AIC is NOT comparable to the
+# ML-based AICs that glmmTMB returns.
+linear_mod <- lmer(sporangia_count ~ temperature + isolate + accession + (1 | replicate),
+                   data = df_analysis, REML = FALSE)
+aic_linear <- AIC(linear_mod)
+
+# poisson glm
+poisson_mod <- glmmTMB(sporangia_count ~ temperature + isolate + accession + (1 | replicate),
+                       family = poisson(link = "log"),
+                       data = df_analysis)
+aic_poisson <- AIC(poisson_mod)
+
+# negative binomial GLMM
+nb_mod <- glmmTMB(sporangia_count ~ temperature + isolate + accession + (1 | replicate),
+                  family = nbinom2,
+                  data = df_analysis)
+aic_nb <- AIC(nb_mod)
+
+
+comparison_df <- data.frame(
+  Model = c("Linear", "Poisson", "Negative Binomial"),
+  AIC = c(aic_linear, aic_poisson, aic_nb),
+  Delta_AIC = c(aic_linear - min(aic_linear, aic_poisson, aic_nb),
+                aic_poisson - min(aic_linear, aic_poisson, aic_nb),
+                aic_nb - min(aic_linear, aic_poisson, aic_nb))
+)
+
+print(comparison_df)
+
+## Delta_AIC = 0 --> Best model
+## Delta_AIC 0-2 --> Essentially equivalent
+## Delta_AIC 2-4 --> Moderate improvement
+## Delta_AIC >4 --> Strong improvement
+
+```
+Best model for the data is the negative binomnial model
+
+### 5.4.1. Neg bi w/ Quadratic temp
+```{r}
+# negative binomial with quadratic(curved) temp
+nb_mod_quad <- glmmTMB(sporangia_count ~ temperature + I(temperature^2) + isolate + accession + (1 | replicate),
+                        family = nbinom2,
+                        data = df_analysis)
+
+overall_sig <- car::Anova(nb_mod_quad, type = "III")
+print(overall_sig)
+```
+nb_mod_quad --> standard negartive bionomial model with a quadratic temp term. This treats every zero count the same way.
+
+```{r}
+# Residual diagnostics for nb_mod_quad
+sim_res <- simulateResiduals(nb_mod_quad, n = 1000)
+
+plot(sim_res)                    # QQ plot + residual vs. predicted
+testDispersion(sim_res)          # is overdispersion actually resolved?
+testZeroInflation(sim_res)       # any leftover excess zeros?
+testOutliers(sim_res)            # flag any problematic points (e.g. 30°C)
+```
+zero inflation test came back significant
+- our data had 18% more zeros than the model expected
+- model wasn't distinguishing between sporulation happened to be zero in this trial, and spoliation never happens under these conditions.
+
+### 5.4.2. Neg bi w/ zero inflation
+```{r}
+# Zero-inflated negative binomial
+## address DHARMa zero-inflation flag
+nb_mod_quad_zi <- glmmTMB(sporangia_count ~ temperature + I(temperature^2) +
+                             isolate + accession + (1 | replicate),
+                           ziformula = ~1,
+                           family = nbinom2,
+                           data = df_analysis)
+
+AIC(nb_mod_quad, nb_mod_quad_zi)
+anova(nb_mod_quad, nb_mod_quad_zi)
+
+sim_res_zi <- simulateResiduals(nb_mod_quad_zi, n = 1000)
+plot(sim_res_zi)
+testZeroInflation(sim_res_zi)
+```
+Zero inflation component
+- separate part of the model whose job it is to estimate what faction of observations are structure zeros on top of the regularnegative binomial processes
+- Still had a ratio of 1.18
+
+```{r}
+# check where the zeros actually cluster (going to be 10, and 30)
+df_analysis %>%
+  group_by(temperature) %>%
+  summarise(
+    n = n(),
+    n_zero = sum(sporangia_count == 0),
+    pct_zero = 100 * n_zero / n,
+    .groups = 'drop'
+  ) %>%
+  arrange(temperature) %>%
+  print(n = Inf)
+```
+
+### 5.4.3. Neg bi w/ zero inflation as a func of temp
+```{r}
+# Zero-inflation as a function of temperature, not a flat intercept
+nb_mod_quad_zi2 <- glmmTMB(sporangia_count ~ temperature + I(temperature^2) +
+                              isolate + accession + (1 | replicate),
+                            ziformula = ~ temperature + I(temperature^2),
+                            family = nbinom2,
+                            data = df_analysis)
+
+AIC(nb_mod_quad, nb_mod_quad_zi, nb_mod_quad_zi2)
+anova(nb_mod_quad, nb_mod_quad_zi2)
+
+sim_res_zi2 <- simulateResiduals(nb_mod_quad_zi2, n = 1000)
+plot(sim_res_zi2)
+testZeroInflation(sim_res_zi2)
+testDispersion(sim_res_zi2)
+testOutliers(sim_res_zi2)
+```
+Same idea as zi, but the porbability of stucture zero is now allowed to depend on temperature.
+- Reduction in AIC by ~40, go with quad zi2 model
+
+## 5.5. Significance testing
+```{r}
+overall_sig <- car::Anova(nb_mod_quad_zi2, type = "III")
+print(overall_sig)
+```
+Temperature and accession have a significant effect on sporulation. Isolate does not.
+Temp P<0.001
+Isolate 0.343
+Accession P< 0.001
+
+```{r}
+# Likelihood ratio tests for severity fixed effects
+drop1(nb_mod_quad_zi2, test = "Chisq")
+```
+
+
+### 5.5.1. Isolates
+```{r}
+# pairwise comparisons --> isolates
+isolate_emm <- emmeans(nb_mod_quad_zi2, ~ isolate)
+isolate_pairwise <- pairs(isolate_emm, adjust = "tukey")
+print(isolate_emm)
+print(isolate_pairwise)
+```
+Isolates have no signficnat differences from one another
+
+### 5.5.2. Hemp accessions
+```{r}
+# Pairwise comparisons --> hemp accessions
+accession_emm <- emmeans(nb_mod_quad_zi2, ~ accession)
+accession_pairwise <- pairs(accession_emm, adjust = "tukey")
+print(accession_emm)
+print(accession_pairwise)
+```
+WCBG and GVA are sign more suceptible than G33312
+GVA vs WCBG are not signficntly differntly susceptible from one another
+
+### 5.5.3. Temperature
+```{r}
+# Pairwise comparisons --> temperature
+## 30C is excluded bc zero sporulation causes model instability
+### (huge SE, meaningless pvalues)
+df_no30 <- df_analysis %>% filter(temperature != 30)
+
+nb_mod_tempfactor_clean <- glmmTMB(sporangia_count ~ factor(temperature) + isolate + accession + (1 | replicate),
+                                    ziformula = ~ factor(temperature),
+                                    family = nbinom2,
+                                    data = df_no30)
+
+temp_emm_clean <- emmeans(nb_mod_tempfactor_clean, ~ factor(temperature))
+temp_pairwise_clean <- pairs(temp_emm_clean, adjust = "tukey")
+print(temp_emm_clean)
+print(temp_pairwise_clean)
+```
+10C sig lower than everything else
+15C sign lower than 18, 20, 25
+18C & 20C not sig diff
+18 & 25 C --> 18C sig more
+20C & 25 --> 20 C sig higher
+
+10<15<25<18,20 20 is the strongest signle point, and 18C is statstically tied with it
+
+low --> 10, 30
+medium --> 15, 25
+high --> 18, 20
+
+```{r}
+# Compact letter display for temperature (30°C excluded, as in the pairwise tests)
+temp_cld <- multcomp::cld(temp_emm_clean, Letters = letters, adjust = "tukey")
+print(temp_cld)
+
+# Rename the first column by POSITION. emmeans labels it "factor(temperature)",
+# which is awkward to reference by name, and `.[[1]]` inside transmute() is
+# fragile.
+sev_letters <- as.data.frame(temp_cld) %>%
+  rename(temp_label = 1) %>%
+  transmute(
+    temperature    = readr::parse_number(as.character(temp_label)),
+    severity_group = trimws(.group)
+  )
+print(sev_letters)
+```
+
+### 5.5.4. Plot - temp sig.
+```{r}
+# Heatmap of pairwise temp comparisons
+# NOTE: this is no longer going in the manuscript (letters in Table 1 instead).
+# Kept here as a record of the full contrast set.
+pw_df <- as.data.frame(temp_pairwise_clean) %>%
+  tidyr::separate(contrast, into = c("temp1", "temp2"), sep = " - ") %>%
+  dplyr::mutate(
+    temp1 = trimws(gsub("temperature", "", temp1)),
+    temp2 = trimws(gsub("temperature", "", temp2)),
+    sig_label = dplyr::case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE ~ ""   # blank if not significant
+    )
+  )
+
+pw_full <- dplyr::bind_rows(
+  pw_df %>% dplyr::select(temp1, temp2, p.value, sig_label),
+  pw_df %>% dplyr::select(temp1 = temp2, temp2 = temp1, p.value, sig_label)
+)
+
+p_heatmap <- ggplot(pw_full, aes(x = temp1, y = temp2, fill = p.value)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = sig_label), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "#E74C3C", high = "white", limits = c(0, 0.05),
+                       oob = scales::squish, name = "p-value",
+                       na.value = "grey95") +
+  labs(title = "Pairwise Temperature Comparisons",
+#"*** p<0.001, ** p<0.01, * p<0.05 (blank = not significant, Tukey-adjusted)\n30°C excluded due to near-zero sporulation (model instability)",
+       x = "Temperature (°C)", y = "Temperature (°C)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 9, hjust = 0.5, color = "gray40"),
+    axis.text = element_text(size = 11),
+    panel.grid = element_blank()
+  )
+
+print(p_heatmap)
+ggsave("Heatmap.png", p_heatmap, dpi = 600, width = 6.5, height = 4.5, units = "in")
+```
+
+# 6. Optimal temperature for sporulation
+
+```{r}
+# Estimate for optimal temp
+coefs <- fixef(nb_mod_quad_zi2)$cond
+vc <- vcov(nb_mod_quad_zi2)$cond
+
+b1 <- coefs["temperature"]
+b2 <- coefs["I(temperature^2)"]
+
+optimal_temp_model <- -b1 / (2 * b2)
+
+# Delta method: propagate uncertainty in b1 and b2 to the optimum
+grad <- c(-1 / (2 * b2), b1 / (2 * b2^2))
+cov_sub <- vc[c("temperature", "I(temperature^2)"), c("temperature", "I(temperature^2)")]
+var_opt <- as.numeric(t(grad) %*% cov_sub %*% grad)
+se_opt <- sqrt(var_opt)
+
+ci_lower <- optimal_temp_model - 1.96 * se_opt
+ci_upper <- optimal_temp_model + 1.96 * se_opt
+
+cat("Model-based optimal temperature:", round(optimal_temp_model, 2), "°C\n")
+cat("95% CI:", round(ci_lower, 2), "-", round(ci_upper, 2), "°C\n")
+```
+
+```{r}
+# Verification --> confimring that peak lands in same place for optimal_temp_model (delta method) and predict(_).
+# Levels are referenced BY POSITION, not by typed-out name, so renaming an
+# isolate or accession upstream can never silently break this chunk.
+grid <- data.frame(
+  temperature = seq(10, 30, by = 0.01),
+  isolate     = factor(levels(df_analysis$isolate)[1],   levels = levels(df_analysis$isolate)),
+  accession   = factor(levels(df_analysis$accession)[1], levels = levels(df_analysis$accession))
+)
+grid$pred <- predict(nb_mod_quad_zi2, newdata = grid,
+                     type = "response", re.form = NA)
+
+cat("Peak of full response curve:", grid$temperature[which.max(grid$pred)], "°C\n")
+cat("Delta-method estimate:      ", round(optimal_temp_model, 2), "°C\n")
+```
+Note:
+nb_mod_quad_zi2 has 2 components working together:
+1.  Zero inflation part --> probability a leaf disc produces nothing at all. Depends on temperature (quadratically), so its high at 10 and 30, low in the middle.
+2. Count part --> given that sporulation happens, how many sporangia. Also quadratic in temp.
+
+Optimal_temp_model (delta method) uses only the count part. So, when sporulation happens, at what temp is it most abundant.
+Predict() peak uses both parts. So, averaged across all discs including the failures, at what temp is sporulation the greatest.
+
+Since both come out to 20.7, there is no distortion. We can say optimal temperature was estimated from fittzed zero inflated negative bniomila model using the delta method (95%).
+
+```{r}
+# Robustness check: 30 C is 100% zeros, which causes complete separation in the
+# zero-inflation component. Refit without it and confirm the optimum holds.
+m_no30 <- glmmTMB(sporangia_count ~ temperature + I(temperature^2) + isolate + accession + (1 | replicate),
+                  ziformula = ~ temperature + I(temperature^2),
+                  family = nbinom2, data = df_no30)
+
+c2 <- fixef(m_no30)$cond
+opt_no30 <- -c2["temperature"] / (2 * c2["I(temperature^2)"])
+cat("Optimum excluding 30 C:", round(opt_no30, 2), "°C\n")
+cat("Optimum from full model:", round(optimal_temp_model, 2), "°C\n")
+```
+
+
+## 6.1. Plot temp. response curves
+```{r}
+# Predicted response curve from the ZINB model, averaged across all isolate x accession combinations to match the pooled group means plotted.
+temp_fine <- seq(10, 30, by = 0.1)
+
+grid_plot <- expand.grid(
+  temperature = temp_fine,
+  isolate     = levels(df_analysis$isolate),
+  accession   = levels(df_analysis$accession)
+)
+grid_plot$pred <- predict(nb_mod_quad_zi2, newdata = grid_plot,
+                          type = "response", re.form = NA)
+
+pred_df <- grid_plot %>%
+  group_by(temperature) %>%
+  summarise(predicted = mean(pred), .groups = "drop") %>%
+  mutate(pred_per_disc = predicted * disc_conversion)
+```
+
+
+```{r}
+# Fig. 1B: observed per-disc means + ZINB predicted curve + optimum.
+# No significance letters - those live in Table 1.
+p_curve <- ggplot() +
+  annotate("rect", xmin = ci_lower, xmax = ci_upper, ymin = -Inf, ymax = Inf,
+           fill = "#E74C3C", alpha = 0.12) +
+  geom_line(data = pred_df, aes(x = temperature, y = pred_per_disc),
+            color = "#E74C3C", linewidth = 0.8) +
+  geom_vline(xintercept = optimal_temp_model, color = "#E74C3C",
+             linetype = "dashed", linewidth = 0.4) +
+  geom_errorbar(data = per_disc_summary,
+                aes(x = temperature,
+                    ymin = mean_per_disc - se_per_disc,
+                    ymax = mean_per_disc + se_per_disc),
+                width = 0.5, color = "grey30") +
+  geom_point(data = per_disc_summary, aes(x = temperature, y = mean_per_disc),
+             shape = 21, fill = "white", size = 2.2, stroke = 0.8) +
+  annotate("text", x = optimal_temp_model + 0.4,
+           y = max(per_disc_summary$mean_per_disc + per_disc_summary$se_per_disc) * 1.08,
+           label = paste0(round(optimal_temp_model, 1), "°C"),
+           hjust = 0, size = 4.5, color = "#E74C3C") +
+  scale_x_continuous(breaks = c(10, 15, 18, 20, 25, 30)) +
+  scale_y_continuous(labels = scales::label_number(scale = 1e-3),
+                     expand = expansion(mult = c(0.02, 0.10))) +
+  labs(x = "Temperature (°C)",
+       y = expression("Sporangia per leaf disc ("*10^3*")")) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank()
+  )
+
+print(p_curve)
+ggsave("optimal_temp.png", p_curve, dpi = 600, width = 3.4, height = 2.6, units = "in")
+```
